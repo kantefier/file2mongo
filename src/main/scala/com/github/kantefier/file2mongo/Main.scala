@@ -5,6 +5,7 @@ import Scalaz._
 import scalaz.stream._
 import scalaz.concurrent.Task
 import scala.io.Codec
+import scala.util.{Try, Failure}
 
 object Main {
     def main(args: Array[String]): Unit = {
@@ -21,31 +22,36 @@ object Main {
         val artistMbId = "[0-9a-z]{8}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{12}"
         val artistWithMbid = raw"""($artistMbId)\s+(.*)""".r
 
+        val linesCount = userLines.length
         val userIdent = userLines.head.split("\\s").head
 
-        //TODO: exception handling???
-        def parseArtistInfo(artistInfo: String): (String, Int) = {
+        def parseArtistInfo(artistInfo: String): Try[(String, Int)] = {
             val tokenized = artistInfo.split("\\s")
-            tokenized.init.mkString(" ").trim -> tokenized.last.toInt
+            Try(tokenized.init.mkString(" ").trim -> tokenized.last.toInt)
         }
 
-        //TODO: exception handling???
-        def parseSingleArtist(userLine: String): (String, Int) = userLine match {
+        def parseSingleArtist(userLine: String): Try[(String, Int)] = userLine match {
             case singleUserLine(_, artistInfo) =>
                 artistInfo match {
                     case artistWithMbid(_, artistInfo) => parseArtistInfo(artistInfo)
                     case artistWithoutMbid => parseArtistInfo(artistInfo)
                 }
+            case failedLine => Failure(new Exception(s"Couldn't parse line: <<$failedLine>>"))
         }
 
-        val artistAndPlays: Vector[(String, Int)] = userLines.map(parseSingleArtist)
-        Process.emit(
-            s"""{
-               |userId: '$userIdent',
-               |library:
-               |${artistAndPlays.map { case (artName, plays) => s"{ artistName: '$artName', plays: $plays }" }.mkString("[", ",\n", "]") }
-               |}""".stripMargin
-        ).to(io.stdOutLines)
+        val artistAndPlays: Vector[(String, Int)] = userLines.flatMap(line => parseSingleArtist(line).fold(_ => Vector.empty, Vector.apply(_)))
+
+        if(artistAndPlays.length.toDouble / linesCount >= 0.8) {
+            Process.emit(
+                s"""{
+                   |userId: '$userIdent',
+                   |library:
+                   |${artistAndPlays.map { case (artName, plays) => s"{ artistName: '$artName', plays: $plays }" }.mkString("[", ",\n", "]") }
+                   |}""".stripMargin
+            ).to(io.stdOutLines)
+        } else {
+            Process.halt
+        }
     }
 
 }
