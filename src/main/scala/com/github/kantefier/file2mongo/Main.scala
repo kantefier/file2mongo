@@ -6,6 +6,7 @@ import scalaz.stream._
 import scalaz.concurrent.Task
 import scala.io.Codec
 import scala.util.{Try, Failure}
+import org.mongodb.scala._
 
 object Main {
     def main(args: Array[String]): Unit = {
@@ -42,13 +43,10 @@ object Main {
         val artistAndPlays: Vector[(String, Int)] = userLines.flatMap(line => parseSingleArtist(line).fold(_ => Vector.empty, Vector.apply(_)))
 
         if(artistAndPlays.length.toDouble / linesCount >= 0.8) {
-            Process.emit(
-                s"""{
-                   |userId: '$userIdent',
-                   |library:
-                   |${artistAndPlays.map { case (artName, plays) => s"{ artistName: '$artName', plays: $plays }" }.mkString("[", ",\n", "]") }
-                   |}""".stripMargin
-            ).to(io.stdOutLines)
+            val userDoc = Document("userId" -> userIdent, "library" -> artistAndPlays.toList.map {
+                case (artName, plays) => Document("artistName" -> artName, "plays" -> plays)
+            }).toString
+            Process.emit(userDoc).to(io.stdOutLines)
         } else {
             Process.halt
         }
