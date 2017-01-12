@@ -13,10 +13,14 @@ object Main {
         println("Hello, world!")
     }
 
-    def fileToChunks(filePath: String): Process[Task, Vector[String]] =
-        io.linesR(filePath)(Codec.UTF8) |> process1.chunkBy2((x, y) => x.takeWhile(_ != '\t') === y.takeWhile(_ != '\t'))
+    def process(fileName: String) = {
+        (io.linesR(fileName)(Codec.UTF8) |> fileToChunks).flatMap(prepareUserDoc)
+    }
 
-    def commitUser(userLines: Vector[String]) = {
+    def fileToChunks =
+        process1.chunkBy2[String]((x, y) => x.takeWhile(_ != '\t') === y.takeWhile(_ != '\t'))
+
+    def prepareUserDoc(userLines: Vector[String]) = {
         //helpers
         val userId = "[0-9a-z]{40}"
         val singleUserLine = raw"""($userId)\s+(.*)""".r
@@ -40,12 +44,19 @@ object Main {
             case failedLine => Failure(new Exception(s"Couldn't parse line: <<$failedLine>>"))
         }
 
+        /*val printObserver = new Observer[Completed] {
+            override def onNext(result: Completed): Unit = println(s"onNext: $result")
+            override def onError(e: Throwable): Unit = println(s"onError: $e")
+            override def onComplete(): Unit = println("onComplete")
+        }*/
+
         val artistAndPlays: Vector[(String, Int)] = userLines.flatMap(line => parseSingleArtist(line).fold(_ => Vector.empty, Vector.apply(_)))
 
         if(artistAndPlays.length.toDouble / linesCount >= 0.8) {
             val userDoc = Document("userId" -> userIdent, "library" -> artistAndPlays.toList.map {
                 case (artName, plays) => Document("artistName" -> artName, "plays" -> plays)
             }).toString
+
             Process.emit(userDoc).to(io.stdOutLines)
         } else {
             Process.halt
