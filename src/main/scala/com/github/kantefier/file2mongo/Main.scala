@@ -14,13 +14,14 @@ object Main {
     }
 
     def process(fileName: String) = {
+//        val db = MongoClient()
         (io.linesR(fileName)(Codec.UTF8) |> fileToChunks).flatMap(prepareUserDoc)
     }
 
     def fileToChunks =
         process1.chunkBy2[String]((x, y) => x.takeWhile(_ != '\t') === y.takeWhile(_ != '\t'))
 
-    def prepareUserDoc(userLines: Vector[String]) = {
+    def prepareUserDoc(userLines: Vector[String]): Process[Task, Document] = {
         //helpers
         val userId = "[0-9a-z]{40}"
         val singleUserLine = raw"""($userId)\s+(.*)""".r
@@ -52,15 +53,14 @@ object Main {
 
         val artistAndPlays: Vector[(String, Int)] = userLines.flatMap(line => parseSingleArtist(line).fold(_ => Vector.empty, Vector.apply(_)))
 
-        if(artistAndPlays.length.toDouble / linesCount >= 0.8) {
-            val userDoc = Document("userId" -> userIdent, "library" -> artistAndPlays.toList.map {
-                case (artName, plays) => Document("artistName" -> artName, "plays" -> plays)
-            }).toString
-
-            Process.emit(userDoc).to(io.stdOutLines)
-        } else {
+        if(artistAndPlays.length.toDouble / linesCount >= 0.8)
+            Process.emit {
+                Document("userId" -> userIdent, "library" -> artistAndPlays.toList.map {
+                    case (artName, plays) => Document("artistName" -> artName, "plays" -> plays)
+                })
+            }
+        else
             Process.halt
-        }
     }
 
 }
