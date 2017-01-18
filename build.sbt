@@ -6,6 +6,6 @@ lazy val root = (project in file(".")).
 		scalaVersion := "2.12.1",
 		libraryDependencies ++=
 			"org.mongodb.scala" %% "mongo-scala-driver" % "1.2.1" ::
-			"org.scalaz" %% "scalaz-core" % "7.2.8" ::
-			"org.scalaz.stream" %% "scalaz-stream" % "0.8.6" :: Nil
+		  	"com.typesafe.akka" %% "akka-actor" % "2.4.16" ::
+		  	"com.typesafe.akka" %% "akka-stream" % "2.4.16" :: Nil
 	)
