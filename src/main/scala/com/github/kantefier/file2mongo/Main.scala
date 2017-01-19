@@ -8,22 +8,43 @@ package com.github.kantefier.file2mongo
 import java.nio.file.Paths
 
 import akka._
+
 import scala.io.Codec
-import scala.util.{Try, Failure}
+import scala.util.{Failure, Try}
 import org.mongodb.scala._
 import akka.stream._
 import akka.stream.scaladsl._
+import akka.stream.stage.{GraphStage, GraphStageLogic, InHandler}
+import akka.util.ByteString
+
+import scala.concurrent.duration.Duration
+import scala.concurrent.{Await, Future, Promise}
 
 object Main {
     def main(args: Array[String]): Unit = {
         println("Hello, world!")
-//        FileIO.fromPath(Paths.get("""/home/kinebogin/dev/dataset/seventy.data"""))
+//        val client = MongoClient()
+//        val db = client.getDatabase("relevance")
+//        val userColl = db.getCollection("users")
+
+//        val fileSource = FileIO.fromPath(Paths.get("""/home/kinebogin/dev/dataset/seventy.data"""))
+//        val fileSource = FileIO.fromPath(Paths.get("""D:\Dev\dataset\hundred""")).map(_.utf8String)
+//        fileSource.via(collectToDocument).to(mongoSink(userColl))
+//        client.close()
     }
+
+    def finalPipeline(filePath: String) = FileIO.
+      fromPath(Paths.get(filePath), chunkSize = 1000).
+      via(Framing.delimiter(ByteString("\n"), 2000, allowTruncation = true)).
+      map(_.utf8String).
+      via(collectToDocument).
+      to(Sink.fromGraph(MongoCommitSink("relevance", "users")))
+
 
     /**
      * Flow from lines to a Mongo Document, containing parsed user info
      */
-    def maflaw: Flow[String, Document, NotUsed] = Flow[String].
+    def collectToDocument: Flow[String, Document, NotUsed] = Flow[String]. //TODO: alas, it has to be overwritten
       groupBy(maxSubstreams = 100, _.takeWhile(_ != '\t')).
       fold(List.empty[String])((lines, currentLine) => currentLine :: lines).
       mapConcat(userLines => userDocFromLines(userLines).toList).
@@ -56,13 +77,6 @@ object Main {
             case failedLine => Failure(new Exception(s"Couldn't parse line: <<$failedLine>>"))
         }
 
-        /*val printObserver = new Observer[Completed] {
-            override def onNext(result: Completed): Unit = println(s"onNext: $result")
-            override def onError(e: Throwable): Unit = println(s"onError: $e")
-            override def onComplete(): Unit = println("onComplete")
-        }*/
-
-
         val artistAndPlays: List[(String, Int)] = userLines.flatMap(line => parseSingleArtist(line).fold(_ => List.empty, List.apply(_)))
 
         if(artistAndPlays.length.toDouble / linesCount >= 0.8)
@@ -71,6 +85,40 @@ object Main {
             }))
         else
             None
+    }
+
+    case class MongoCommitSink(database: String, collection: String) extends GraphStage[SinkShape[Document]] {
+        val in: Inlet[Document] = Inlet("docInput")
+        override val shape = SinkShape(in)
+
+        override def createLogic(inheritedAttributes: Attributes) = new GraphStageLogic(shape) {
+            private val clientPromise = Promise[MongoClient]()
+            private lazy val client = Await.result(clientPromise.future, Duration("1 second"))
+            private lazy val coll: MongoCollection[Document] = client.
+              getDatabase(database).
+              getCollection(collection)
+
+
+            //open client session
+            override def preStart(): Unit = {
+                clientPromise.success(MongoClient())
+                pull(in)
+            }
+
+            //close client session
+            override def postStop(): Unit = {
+                client.close()
+                println("Closed MongoClient")
+            }
+
+            setHandler(in, new InHandler {
+                override def onPush() = {
+                    //TODO: subscribe to handle error events
+                    coll.insertOne(grab(in)).subscribe((x: Completed) => println(x))
+                    pull(in)
+                }
+            })
+        }
     }
 
 }
