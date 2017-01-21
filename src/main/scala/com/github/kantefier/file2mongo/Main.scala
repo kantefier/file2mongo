@@ -1,60 +1,73 @@
 package com.github.kantefier.file2mongo
 
-//import scalaz._
-//import Scalaz._
-//import scalaz.stream._
-//import scalaz.concurrent.Task
-
 import java.nio.file.Paths
 
 import akka._
+import akka.actor.ActorSystem
+import reactivemongo.api.commands.WriteResult
+import reactivemongo.bson.BSONDocument
 
+import scala.concurrent.duration.FiniteDuration
 import scala.io.Codec
-import scala.util.{Failure, Try}
-import org.mongodb.scala._
+import scala.util.{Failure, Success, Try}
 import akka.stream._
 import akka.stream.scaladsl._
-import akka.stream.stage.{GraphStage, GraphStageLogic, InHandler}
+import akka.stream.stage.{GraphStage, GraphStageLogic, InHandler, OutHandler}
 import akka.util.ByteString
+import reactivemongo.bson._
+import reactivemongo.api._
+import reactivemongo.api.collections.bson.BSONCollection
 
 import scala.concurrent.duration.Duration
-import scala.concurrent.{Await, Future, Promise}
+import scala.concurrent.{Await, ExecutionContext, Future, Promise}
 
 object Main {
     def main(args: Array[String]): Unit = {
-        println("Hello, world!")
-//        val client = MongoClient()
-//        val db = client.getDatabase("relevance")
-//        val userColl = db.getCollection("users")
+        val argMap = argsToMap(args)
+        argMap.get("-dataset") match {
+            case Some(path) =>
+                implicit val system = ActorSystem()
+                implicit val mat = ActorMaterializer()
+                finalPipeline(path).run()
+                //onComplete(_ => system.terminate())(mat.executionContext)TODO: it fires immediately. Have to find appropriate shutdown pattern
+                // workaround
+                system.scheduler.scheduleOnce(FiniteDuration(10, "minutes"))(system.terminate())(mat.executionContext)
 
-//        val fileSource = FileIO.fromPath(Paths.get("""/home/kinebogin/dev/dataset/seventy.data"""))
-//        val fileSource = FileIO.fromPath(Paths.get("""D:\Dev\dataset\hundred""")).map(_.utf8String)
-//        fileSource.via(collectToDocument).to(mongoSink(userColl))
-//        client.close()
+            case _ => println("Not used correctly. Doing nothing.")
+        }
     }
 
+    /**
+      * Parses command line arguments, separated by space.
+      * Example of an argument: -argName=argValue
+      */
+    def argsToMap(args: Array[String]): Map[String, String] = args.toList.flatMap(_.split('=').toList match {
+        case argName :: argValue => (argName -> argValue.mkString) :: Nil
+        case _ => Nil
+    }).toMap
+
+    /**
+      * Assembled streaming pipeline
+      */
     def finalPipeline(filePath: String) = FileIO.
       fromPath(Paths.get(filePath), chunkSize = 1000).
       via(Framing.delimiter(ByteString("\n"), 2000, allowTruncation = true)).
       map(_.utf8String).
-      via(collectToDocument).
+      via(Flow.fromGraph(new UserLinesCollector)).
+      via(linesToDocument).
       to(Sink.fromGraph(MongoCommitSink("relevance", "users")))
-
 
     /**
      * Flow from lines to a Mongo Document, containing parsed user info
      */
-    def collectToDocument: Flow[String, Document, NotUsed] = Flow[String]. //TODO: alas, it has to be overwritten
-      groupBy(maxSubstreams = 100, _.takeWhile(_ != '\t')).
-      fold(List.empty[String])((lines, currentLine) => currentLine :: lines).
-      mapConcat(userLines => userDocFromLines(userLines).toList).
-      mergeSubstreams
+    def linesToDocument: Flow[List[String], BSONDocument, NotUsed] = Flow[List[String]].
+      mapConcat(userLines => userDocFromLines(userLines).toList)
 
 
     /**
      *  Parse a Mongo Document from user lines
      */
-    def userDocFromLines(userLines: List[String]): Option[Document] = {
+    def userDocFromLines(userLines: List[String]): Option[BSONDocument] = {
         val userId = "[0-9a-z]{40}"
         val singleUserLine = raw"""($userId)\s+(.*)""".r
         val artistMbId = "[0-9a-z]{8}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{12}"
@@ -80,42 +93,93 @@ object Main {
         val artistAndPlays: List[(String, Int)] = userLines.flatMap(line => parseSingleArtist(line).fold(_ => List.empty, List.apply(_)))
 
         if(artistAndPlays.length.toDouble / linesCount >= 0.8)
-            Some(Document("userId" -> userIdent, "library" -> artistAndPlays.toList.map {
-                case (artName, plays) => Document("artistName" -> artName, "plays" -> plays)
+            Some(BSONDocument("userId" -> userIdent, "library" -> artistAndPlays.toList.map {
+                case (artName, plays) => BSONDocument("artistName" -> artName, "plays" -> plays)
             }))
-        else
-            None
+        else None
     }
 
-    case class MongoCommitSink(database: String, collection: String) extends GraphStage[SinkShape[Document]] {
-        val in: Inlet[Document] = Inlet("docInput")
+    /**
+      * Sink to commit documents to specified database and collection. Initiates Mongo Driver on start
+      */
+    case class MongoCommitSink(database: String, collection: String) extends GraphStage[SinkShape[BSONDocument]] {
+        val in: Inlet[BSONDocument] = Inlet("docInput")
         override val shape = SinkShape(in)
 
         override def createLogic(inheritedAttributes: Attributes) = new GraphStageLogic(shape) {
-            private val clientPromise = Promise[MongoClient]()
-            private lazy val client = Await.result(clientPromise.future, Duration("1 second"))
-            private lazy val coll: MongoCollection[Document] = client.
-              getDatabase(database).
-              getCollection(collection)
-
+            var driver: MongoDriver = _
+            var connection: MongoConnection = _
 
             //open client session
-            override def preStart(): Unit = {
-                clientPromise.success(MongoClient())
-                pull(in)
+            override def preStart(): Unit = MongoConnection.parseURI("mongodb://localhost") match {
+                case Success(parsedUri) =>
+                    println("MongoDriver init")
+                    driver = MongoDriver()
+                    connection = driver.connection(parsedUri)
+                    pull(in)
+                case Failure(ex) =>
+                    failStage(ex)
             }
 
             //close client session
             override def postStop(): Unit = {
-                client.close()
-                println("Closed MongoClient")
+                println("Closing MongoDriver")
+                driver.close()
+                println("Closed MongoDriver")
+            }
+
+            def errPrint(wr: WriteResult): Unit = if(!wr.ok) {
+                println(wr.writeErrors.map(_.errmsg).mkString(";"))
             }
 
             setHandler(in, new InHandler {
                 override def onPush() = {
-                    //TODO: subscribe to handle error events
-                    coll.insertOne(grab(in)).subscribe((x: Completed) => println(x))
+                    val doc = grab(in)
+                    implicit val ec = materializer.executionContext
+                    val dbAction = for {
+                        db <- connection.database(database)
+                        insertRes <- db.collection[BSONCollection](collection).insert(doc)
+                        _ <- Future( errPrint(insertRes) )
+                    } yield ()
+                    Await.ready(dbAction, Duration("2 seconds"))
                     pull(in)
+                }
+            })
+        }
+    }
+
+    class UserLinesCollector extends GraphStage[FlowShape[String, List[String]]] {
+        val in: Inlet[String] = Inlet("inLine")
+        val out: Outlet[List[String]] = Outlet("outLines")
+
+        val shape = FlowShape(in, out)
+
+        override def createLogic(inheritedAttributes: Attributes) = new GraphStageLogic(shape) {
+            var isFirstIteration = true
+            var currentUserIdent: String = ""
+            var userLinesAccum: List[String] = List.empty
+
+            setHandler(in, new InHandler {
+                override def onPush() = {
+                    val str = grab(in)
+                    if(isFirstIteration) {
+                        userLinesAccum = str :: Nil
+                        currentUserIdent = str.takeWhile(_ != '\t')
+                        isFirstIteration = false
+                    } else if(str.startsWith(currentUserIdent)) {
+                        userLinesAccum = str :: userLinesAccum
+                    } else {
+                        push(out, userLinesAccum)
+                        userLinesAccum = str :: Nil
+                        currentUserIdent = str.takeWhile(_ != '\t')
+                    }
+                    if(!hasBeenPulled(in)) pull(in)
+                }
+            })
+
+            setHandler(out, new OutHandler {
+                override def onPull() = {
+                    if(!hasBeenPulled(in)) pull(in)
                 }
             })
         }

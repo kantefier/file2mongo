@@ -1,0 +1,4 @@
+<configuration>
+    <logger name="reactivemongo" level="ERROR" />
+    <root level="WARN" />
+</configuration>
