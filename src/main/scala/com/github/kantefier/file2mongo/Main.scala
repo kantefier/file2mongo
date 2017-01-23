@@ -26,9 +26,9 @@ object Main {
         val argMap = argsToMap(args)
         argMap.get("-dataset") match {
             case Some(path) =>
-                implicit val system = ActorSystem()
-                implicit val mat = ActorMaterializer()
-                finalPipeline(path).run().onComplete(_ => system.terminate())(mat.executionContext)
+                val system = ActorSystem()
+                val mat = ActorMaterializer()
+                finalPipeline(path).run()(mat).onComplete(_ => system.terminate())(mat.executionContext)
 
             case _ => println("Not used correctly. Doing nothing.")
         }
