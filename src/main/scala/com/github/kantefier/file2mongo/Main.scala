@@ -12,7 +12,7 @@ import scala.io.Codec
 import scala.util.{Failure, Success, Try}
 import akka.stream._
 import akka.stream.scaladsl._
-import akka.stream.stage.{GraphStage, GraphStageLogic, InHandler, OutHandler}
+import akka.stream.stage._
 import akka.util.ByteString
 import reactivemongo.bson._
 import reactivemongo.api._
@@ -28,10 +28,7 @@ object Main {
             case Some(path) =>
                 implicit val system = ActorSystem()
                 implicit val mat = ActorMaterializer()
-                finalPipeline(path).run()
-                //onComplete(_ => system.terminate())(mat.executionContext)TODO: it fires immediately. Have to find appropriate shutdown pattern
-                // workaround
-                system.scheduler.scheduleOnce(FiniteDuration(10, "minutes"))(system.terminate())(mat.executionContext)
+                finalPipeline(path).run().onComplete(_ => system.terminate())(mat.executionContext)
 
             case _ => println("Not used correctly. Doing nothing.")
         }
@@ -55,7 +52,7 @@ object Main {
       map(_.utf8String).
       via(Flow.fromGraph(new UserLinesCollector)).
       via(linesToDocument).
-      to(Sink.fromGraph(MongoCommitSink("relevance", "users")))
+      to(Sink.fromGraph(MongoCommitSink("relevance", "test")))
 
     /**
      * Flow from lines to a Mongo Document, containing parsed user info
@@ -102,49 +99,56 @@ object Main {
     /**
       * Sink to commit documents to specified database and collection. Initiates Mongo Driver on start
       */
-    case class MongoCommitSink(database: String, collection: String) extends GraphStage[SinkShape[BSONDocument]] {
+    case class MongoCommitSink(database: String, collection: String) extends GraphStageWithMaterializedValue[SinkShape[BSONDocument], Future[Done]] {
         val in: Inlet[BSONDocument] = Inlet("docInput")
         override val shape = SinkShape(in)
 
-        override def createLogic(inheritedAttributes: Attributes) = new GraphStageLogic(shape) {
-            var driver: MongoDriver = _
-            var connection: MongoConnection = _
+        override def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, Future[Done]) = {
+            val finishPromise = Promise[Done]()
+            val logic = new GraphStageLogic(shape) {
 
-            //open client session
-            override def preStart(): Unit = MongoConnection.parseURI("mongodb://localhost") match {
-                case Success(parsedUri) =>
-                    println("MongoDriver init")
-                    driver = MongoDriver()
-                    connection = driver.connection(parsedUri)
-                    pull(in)
-                case Failure(ex) =>
-                    failStage(ex)
-            }
+                var driver: MongoDriver = _
+                var connection: MongoConnection = _
 
-            //close client session
-            override def postStop(): Unit = {
-                println("Closing MongoDriver")
-                driver.close()
-                println("Closed MongoDriver")
-            }
-
-            def errPrint(wr: WriteResult): Unit = if(!wr.ok) {
-                println(wr.writeErrors.map(_.errmsg).mkString(";"))
-            }
-
-            setHandler(in, new InHandler {
-                override def onPush() = {
-                    val doc = grab(in)
-                    implicit val ec = materializer.executionContext
-                    val dbAction = for {
-                        db <- connection.database(database)
-                        insertRes <- db.collection[BSONCollection](collection).insert(doc)
-                        _ <- Future( errPrint(insertRes) )
-                    } yield ()
-                    Await.ready(dbAction, Duration("2 seconds"))
-                    pull(in)
+                //open client session
+                override def preStart(): Unit = MongoConnection.parseURI("mongodb://localhost") match {
+                    case Success(parsedUri) =>
+                        println("MongoDriver init")
+                        driver = MongoDriver()
+                        connection = driver.connection(parsedUri)
+                        pull(in)
+                    case Failure(ex) =>
+                        failStage(ex)
                 }
-            })
+
+                //close client session
+                override def postStop(): Unit = {
+                    println("MongoSink: signalling about completetion")
+                    finishPromise.success(Done)
+                    println("Closing MongoDriver")
+                    driver.close()
+                    println("Closed MongoDriver")
+                }
+
+                def errPrint(wr: WriteResult): Unit = if (!wr.ok) {
+                    println(wr.writeErrors.map(_.errmsg).mkString(";"))
+                }
+
+                setHandler(in, new InHandler {
+                    override def onPush() = {
+                        val doc = grab(in)
+                        implicit val ec = materializer.executionContext
+                        val dbAction = for {
+                            db <- connection.database(database)
+                            insertRes <- db.collection[BSONCollection](collection).insert(doc)
+                            _ <- Future(errPrint(insertRes))
+                        } yield ()
+                        Await.ready(dbAction, Duration("2 seconds"))
+                        pull(in)
+                    }
+                })
+            }
+            (logic, finishPromise.future)
         }
     }
 
